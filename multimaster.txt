@@ -1,0 +1,183 @@
+wget https://pkg.cfssl.org/R1.2/cfssl_linux-amd64
+wget https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64
+ chmod +x cfssl*
+ mv cfssl_linux-amd64 /usr/bin/cfssl
+ mv cfssljson_linux-amd64 /usr/bin/
+ 
+ cfssl version
+ yum install -y  haproxy
+ vi /etc/haproxy/haproxy.cfg
+ #---------------------------------------------------------------------
+# main frontend which proxys to the backends
+#---------------------------------------------------------------------
+frontend kubernetes
+    bind *:6443
+    option tcplog
+    acl url_static       path_beg       -i /static /images /javascript /stylesheets
+    acl url_static       path_end       -i .jpg .gif .png .css .js
+
+    use_backend static          if url_static
+    mode tcp
+    default_backend      kubernetes-master-nodes
+
+#---------------------------------------------------------------------
+# static backend for serving up images, stylesheets and such
+#---------------------------------------------------------------------
+backend static
+    balance     roundrobin
+    server      static 127.0.0.1:4331 check
+
+#---------------------------------------------------------------------
+# round robin balancing between the various backends
+#---------------------------------------------------------------------
+backend kubernetes-master-nodes
+    mode tcp
+    option tcp-check
+    balance     roundrobin
+    server  app1 10.19.0.7:6443 check fall 3 rise 2
+    server  app2 10.19.0.8:6443 check fall 3 rise 2
+    server  app3 10.19.0.9:6443 check fall 3 rise 2
+
+
+Certificate
+1. vim ca-config.json
+{
+  "signing": {
+    "default": {
+      "expiry": "8760h"
+    },
+    "profiles": {
+      "kubernetes": {
+        "usages": ["signing", "key encipherment", "server auth", "client auth"],
+        "expiry": "8760h"
+      }
+    }
+  }
+}
+2. vim ca-csr.json
+{
+  "CN": "Kubernetes",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+  {
+    "C": "IE",
+    "L": "Cork",
+    "O": "Kubernetes",
+    "OU": "CA",
+    "ST": "Cork Co."
+  }
+ ]
+}
+3. cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+4. Verify that the ca-key.pem and the ca.pem were generated.
+
+ETCD CERTIFICATE:
+1.vim kubernetes-csr.json
+{
+  "CN": "kubernetes",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+  {
+    "C": "IE",
+    "L": "Cork",
+    "O": "Kubernetes",
+    "OU": "Kubernetes",
+    "ST": "Cork Co."
+  }
+ ]
+}
+2.cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -hostname=10.19.0.7,10.19.0.8,10.19.0.9,10.19.0.4,127.0.0.1,kubernetes.default -profile=kubernetes kubernetes-csr.json | cfssljson -bare kubernetes
+IPS: 3 master-nodes,haproxy nodes
+3.Verify that the kubernetes-key.pem and the kubernetes.pem file were generated.
+4. Copy the certificate to each node (you can use following command to copy the files to all the nodes together or you can do scp individually).
+scp ca.pem kubernetes.pem kubernetes-key.pem  sowmi@ip:/home/sowmi
+
+
+ETCD Stup in master nodes:
+mkdir /etc/etcd /var/lib/etcd
+mv ~/ca.pem ~/kubernetes.pem ~/kubernetes-key.pem /etc/etcd
+wget https://github.com/etcd-io/etcd/releases/download/v3.5.4/etcd-v3.5.4-linux-amd64.tar.gz
+archive the tar 
+mv etcd-v3.5.4-linux-amd64/etcd* /usr/bin/
+vim /etc/systemd/system/etcd.service
+[Unit]
+Description=etcd
+Documentation=https://github.com/coreos
+
+[Service]
+ExecStart=/usr/bin/etcd \
+  --name 10.19.0.7 \
+  --cert-file=/etc/etcd/kubernetes.pem \
+  --key-file=/etc/etcd/kubernetes-key.pem \
+  --peer-cert-file=/etc/etcd/kubernetes.pem \
+  --peer-key-file=/etc/etcd/kubernetes-key.pem \
+  --trusted-ca-file=/etc/etcd/ca.pem \
+  --peer-trusted-ca-file=/etc/etcd/ca.pem \
+  --peer-client-cert-auth \
+  --client-cert-auth \
+  --initial-advertise-peer-urls https://10.19.0.7:2380 \
+  --listen-peer-urls https://10.19.0.7:2380 \
+  --listen-client-urls https://10.19.0.7:2379,http://127.0.0.1:2379 \
+  --advertise-client-urls https://10.19.0.7:2379 \
+  --initial-cluster-token etcd-cluster-0 \
+  --initial-cluster 10.19.0.7=https://10.19.0.7:2380,10.19.0.8=https://10.19.0.8:2380,10.19.0.9=https://10.19.0.9:2380 \
+  --initial-cluster-state new \
+  --data-dir=/var/lib/etcd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+systemctl daemon-reload
+enable
+start
+Perform all the steps on other Master (.8 and .9) by replacing IP
+ETCDCTL_API=3 etcdctl member list
+
+
+
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v1.22.1"
+apiServer:
+  certSANs:
+  - "10.19.0.4"
+  ExtraArgs:
+    apiserver-count: "3"
+controlPlaneEndpoint: "10.19.0.4:6443"
+etcd:
+  external:
+    endpoints:
+    - https://10.19.0.7:2379
+    - https://10.19.0.8:2379
+    - https://10.19.0.9:2379
+    caFile: /etc/etcd/ca.pem
+    certFile: /etc/etcd/kubernetes.pem
+    keyFile: /etc/etcd/kubernetes-key.pem
+networking:
+    podSubnet: 192.168.0.0/16
+
+
+
+kubeadm init --config=config.yamlCopy the certificates to the two other masters.
+
+# scp -r /etc/kubernetes/pki ubuntu@10.1.1.22:~
+# scp -r /etc/kubernetes/pki ubuntu@10.1.1.23:~
+login to other master nodes and
+rm ~/pki/apiserver.*
+mv ~/pki /etc/kubernetes/
+
+
+
+
+
+
+ 
